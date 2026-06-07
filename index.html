@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Video Cutter</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: monospace; background: #111; color: #eee; padding: 16px; font-size: 13px; }
+h1 { font-size: 16px; margin-bottom: 16px; }
+.sec { margin-bottom: 14px; }
+label { display: block; font-size: 11px; color: #aaa; margin-bottom: 4px; }
+input[type="file"] { width: 100%; background: #222; color: #eee; border: 1px solid #444; padding: 6px; font-family: monospace; font-size: 11px; }
+input[type="range"] { width: 100%; }
+button { background: #333; color: #fff; border: 1px solid #555; padding: 10px; font-family: monospace; font-size: 13px; cursor: pointer; width: 100%; margin-top: 6px; }
+button:hover:not(:disabled) { background: #555; }
+button:disabled { color: #555; cursor: not-allowed; }
+button.primary { background: #1a3a1a; border-color: #3a7a3a; color: #8f8; }
+button.primary:hover:not(:disabled) { background: #2a5a2a; }
+#log { background: #0a0a0a; border: 1px solid #333; padding: 10px; font-size: 11px; min-height: 80px; max-height: 200px; overflow-y: auto; color: #8f8; white-space: pre-wrap; margin-top: 8px; }
+#log .err { color: #f88; }
+#log .info { color: #88f; }
+video, audio { width: 100%; margin-top: 6px; display: none; }
+.status { font-size: 10px; color: #fa0; margin-top: 3px; }
+hr { border: none; border-top: 1px solid #333; margin: 14px 0; }
+#downloadArea { display: none; margin-top: 10px; }
+#downloadArea a { display: block; background: #1a3a1a; border: 1px solid #3a7a3a; color: #8f8; text-align: center; padding: 12px; text-decoration: none; font-family: monospace; }
+.row { display: flex; gap: 8px; }
+.row .sec { flex: 1; }
+progress { width: 100%; height: 8px; margin-top: 6px; display: none; }
+</style>
+</head>
+<body>
+<h1>🎬 Video Cutter – Prototyp</h1>
+
+<div class="sec">
+  <label>VIDEO</label>
+  <input type="file" id="videoInput" accept="video/*">
+  <video id="videoPreview" controls></video>
+  <div class="status" id="videoStatus"></div>
+</div>
+
+<div class="row">
+  <div class="sec">
+    <label>SONG 1 – Dramatisch</label>
+    <input type="file" id="song1Input" accept="audio/*">
+    <audio id="audio1Preview" controls></audio>
+    <div class="status" id="song1Status"></div>
+  </div>
+  <div class="sec">
+    <label>SONG 2 – Ruhig</label>
+    <input type="file" id="song2Input" accept="audio/*">
+    <audio id="audio2Preview" controls></audio>
+    <div class="status" id="song2Status"></div>
+  </div>
+</div>
+
+<div class="sec">
+  <label>STILLE-SCHWELLE: <span id="silenceVal">-35</span> dB</label>
+  <input type="range" id="silenceThresh" min="-60" max="-10" value="-35" oninput="document.getElementById('silenceVal').textContent=this.value">
+</div>
+
+<div class="sec">
+  <label>MINDEST-STILLE: <span id="silenceDurVal">0.5</span>s</label>
+  <input type="range" id="silenceDur" min="0.1" max="2" step="0.1" value="0.5" oninput="document.getElementById('silenceDurVal').textContent=this.value">
+</div>
+
+<hr>
+
+<button class="primary" id="analyzeBtn" onclick="analyze()">▶ ANALYSIEREN + SCHNEIDEN</button>
+<progress id="prog" max="1"></progress>
+<div id="log">Bereit. Video + Songs hochladen, dann Analysieren drücken.</div>
+<div id="downloadArea">
+  <a id="downloadLink" href="#">⬇ FERTIGES VIDEO HERUNTERLADEN</a>
+</div>
+
+<!-- FFmpeg 0.11 – kein SharedArrayBuffer nötig, kein Worker-CORS-Problem -->
+<script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
+<script>
+var files = { video: null, song1: null, song2: null };
+var ffmpegReady = false;
+var ff = null;
+
+function addLog(msg, type) {
+  var el = document.getElementById('log');
+  var line = document.createElement('div');
+  if (type) line.className = type;
+  line.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+
+function setProgress(v) {
+  var p = document.getElementById('prog');
+  p.style.display = 'block';
+  p.value = v;
+}
+
+document.getElementById('videoInput').addEventListener('change', function(e) {
+  var f = e.target.files[0]; if (!f) return;
+  files.video = f;
+  var vid = document.getElementById('videoPreview');
+  vid.src = URL.createObjectURL(f); vid.style.display = 'block';
+  document.getElementById('videoStatus').textContent = '✓ ' + f.name + ' (' + (f.size/1024/1024).toFixed(1) + ' MB)';
+  addLog('Video geladen: ' + f.name);
+});
+
+document.getElementById('song1Input').addEventListener('change', function(e) {
+  var f = e.target.files[0]; if (!f) return;
+  files.song1 = f;
+  var aud = document.getElementById('audio1Preview');
+  aud.src = URL.createObjectURL(f); aud.style.display = 'block';
+  document.getElementById('song1Status').textContent = '✓ ' + f.name;
+  addLog('Song 1: ' + f.name);
+});
+
+document.getElementById('song2Input').addEventListener('change', function(e) {
+  var f = e.target.files[0]; if (!f) return;
+  files.song2 = f;
+  var aud = document.getElementById('audio2Preview');
+  aud.src = URL.createObjectURL(f); aud.style.display = 'block';
+  document.getElementById('song2Status').textContent = '✓ ' + f.name;
+  addLog('Song 2: ' + f.name);
+});
+
+async function analyzeAudio(file) {
+  addLog('Analysiere Lautstärke...', 'info');
+  var ctx = new (window.AudioContext || window.webkitAudioContext)();
+  var buf = await file.arrayBuffer();
+  var decoded = await ctx.decodeAudioData(buf);
+  var data = decoded.getChannelData(0);
+  var frameSize = Math.floor(decoded.sampleRate * 0.05);
+  var rms = [];
+  for (var i = 0; i < data.length; i += frameSize) {
+    var frame = data.slice(i, i + frameSize);
+    var sum = 0;
+    for (var j = 0; j < frame.length; j++) sum += frame[j] * frame[j];
+    rms.push(Math.sqrt(sum / frame.length));
+  }
+  await ctx.close();
+  return { rms: rms, duration: decoded.duration };
+}
+
+function rmsToDb(r) { return r > 0 ? 20 * Math.log10(r) : -100; }
+
+function findActiveSegments(rms, threshDb, minDurS) {
+  var minFrames = Math.ceil(minDurS / 0.05);
+  var active = [], inActive = false, start = 0;
+  for (var i = 0; i < rms.length; i++) {
+    var loud = rmsToDb(rms[i]) >= threshDb;
+    if (loud && !inActive) { start = i; inActive = true; }
+    else if (!loud && inActive) {
+      if (i - start >= minFrames) active.push({ start: start * 0.05, end: i * 0.05 });
+      inActive = false;
+    }
+  }
+  if (inActive && rms.length - start >= minFrames)
+    active.push({ start: start * 0.05, end: rms.length * 0.05 });
+  return active;
+}
+
+function segAvgRms(rms, startS, endS) {
+  var s = Math.floor(startS/0.05), e = Math.ceil(endS/0.05);
+  var slice = rms.slice(s, e);
+  if (!slice.length) return 0;
+  return slice.reduce(function(a,b){return a+b;},0)/slice.length;
+}
+
+async function loadFFmpeg() {
+  if (ffmpegReady) return;
+  addLog('Lade FFmpeg...', 'info');
+  ff = FFmpeg.createFFmpeg({
+    log: false,
+    corePath: 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js'
+  });
+  await ff.load();
+  ffmpegReady = true;
+  addLog('FFmpeg geladen ✓');
+}
+
+async function analyze() {
+  if (!files.video) { addLog('❌ Kein Video!', 'err'); return; }
+
+  var btn = document.getElementById('analyzeBtn');
+  btn.disabled = true; btn.textContent = '⏳ Läuft...';
+  document.getElementById('downloadArea').style.display = 'none';
+  setProgress(0);
+
+  try {
+    var threshDb = parseFloat(document.getElementById('silenceThresh').value);
+    var minDur = parseFloat(document.getElementById('silenceDur').value);
+
+    var analysis = await analyzeAudio(files.video);
+    addLog('Dauer: ' + analysis.duration.toFixed(1) + 's', 'info');
+    setProgress(0.1);
+
+    var activeSegs = findActiveSegments(analysis.rms, threshDb, minDur);
+    addLog(activeSegs.length + ' aktive Segmente');
+    setProgress(0.15);
+
+    if (activeSegs.length === 0) {
+      addLog('❌ Keine Segmente – Schwelle höher setzen (z.B. -25 dB)', 'err');
+      btn.disabled = false; btn.textContent = '▶ ANALYSIEREN + SCHNEIDEN'; return;
+    }
+
+    // Dramatisch/Ruhig
+    var rmsVals = activeSegs.map(function(s){ return segAvgRms(analysis.rms, s.start, s.end); });
+    var avgRms = rmsVals.reduce(function(a,b){return a+b;},0)/rmsVals.length;
+    var classified = activeSegs.map(function(s,i){ return { start:s.start, end:s.end, dramatic: rmsVals[i]>avgRms }; });
+    var dCount = classified.filter(function(s){return s.dramatic;}).length;
+    addLog('Dramatisch: ' + dCount + ' | Ruhig: ' + (classified.length-dCount));
+    setProgress(0.2);
+
+    await loadFFmpeg();
+
+    // Dateien laden
+    addLog('Lade Dateien...', 'info');
+    ff.FS('writeFile', 'input.mp4', await FFmpeg.fetchFile(files.video));
+    if (files.song1) ff.FS('writeFile', 'song1.mp3', await FFmpeg.fetchFile(files.song1));
+    if (files.song2) ff.FS('writeFile', 'song2.mp3', await FFmpeg.fetchFile(files.song2));
+    setProgress(0.3);
+
+    // Clips schneiden
+    var clipFiles = [];
+    for (var i = 0; i < classified.length; i++) {
+      var seg = classified[i];
+      var fname = 'clip' + i + '.mp4';
+      var dur = (seg.end - seg.start).toFixed(3);
+      await ff.run('-ss', seg.start.toFixed(3), '-i', 'input.mp4', '-t', dur, '-c', 'copy', '-avoid_negative_ts', 'make_zero', fname);
+      clipFiles.push(fname);
+      addLog('Clip '+(i+1)+'/'+classified.length+': '+seg.start.toFixed(1)+'s–'+seg.end.toFixed(1)+'s '+(seg.dramatic?'🔴':'🔵'));
+      setProgress(0.3 + (i+1)/classified.length * 0.4);
+    }
+
+    // Concat
+    addLog('Zusammenführen...', 'info');
+    var concatTxt = clipFiles.map(function(f){ return "file '"+f+"'"; }).join('\n');
+    ff.FS('writeFile', 'concat.txt', concatTxt);
+    await ff.run('-f','concat','-safe','0','-i','concat.txt','-c','copy','merged.mp4');
+    setProgress(0.8);
+
+    // Musik
+    var finalFile = 'merged.mp4';
+    if (files.song1 || files.song2) {
+      addLog('Mische Musik...', 'info');
+      var music = files.song1 ? 'song1.mp3' : 'song2.mp3';
+      await ff.run('-i','merged.mp4','-i',music,
+        '-filter_complex','[0:a]volume=1[oa];[1:a]volume=0.4[ob];[oa][ob]amix=inputs=2:duration=first[aout]',
+        '-map','0:v','-map','[aout]','-c:v','copy','-c:a','aac','-shortest','output.mp4');
+      finalFile = 'output.mp4';
+    }
+    setProgress(0.95);
+
+    // Download
+    var data = ff.FS('readFile', finalFile);
+    var blob = new Blob([data.buffer], { type: 'video/mp4' });
+    var url = URL.createObjectURL(blob);
+    var dl = document.getElementById('downloadLink');
+    dl.href = url; dl.download = 'geschnitten.mp4';
+    document.getElementById('downloadArea').style.display = 'block';
+    setProgress(1);
+    addLog('✅ Fertig – Download-Button erschienen!');
+
+  } catch(e) {
+    addLog('❌ ' + e.message, 'err');
+    console.error(e);
+  }
+
+  btn.disabled = false; btn.textContent = '▶ ANALYSIEREN + SCHNEIDEN';
+}
+</script>
+</body>
+</html>
